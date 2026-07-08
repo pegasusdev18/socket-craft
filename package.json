@@ -1,0 +1,24 @@
+{
+  "name": "socket-craft",
+  "version": "1.0.0",
+  "description": "Zero-config, file-based routing WebSocket framework for Node.js",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "ws": "^8.17.1"
+  },
+  "keywords": [
+    "websocket",
+    "ws",
+    "realtime",
+    "framework",
+    "file-based-routing"
+  ],
+  "license": "MIT"
+}
