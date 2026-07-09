@@ -4,6 +4,26 @@ import { Router } from './router.js'
 import { Store } from './store.js'
 import { SocketCraftSocket } from './socket.js'
 
+function validatePayload(schema, data) {
+  if (!schema) return true
+  if (data === null || Array.isArray(data)) return false
+  if (typeof data !== 'object') return false
+  for (const key in schema) {
+    const expectedType = schema[key]
+    const value = data[key]
+    if (expectedType === 'array') {
+      if (!Array.isArray(value)) return false
+      continue
+    }
+    if (expectedType === 'object') {
+      if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
+      continue
+    }
+    if (typeof value !== expectedType) return false
+  }
+  return true
+}
+
 export class SocketCraftServer {
   constructor(options = {}) {
     this.options = {
@@ -12,6 +32,7 @@ export class SocketCraftServer {
       port: options.port || 4000,
       pingInterval: options.pingInterval || 30000,
       basePath: options.basePath || '',
+      maxBackpressure: options.maxBackpressure || 1048576,
       ...options
     }
     this.store = new Store()
@@ -46,14 +67,22 @@ export class SocketCraftServer {
     if (this.options.basePath && pathname.startsWith(this.options.basePath)) {
       pathname = pathname.slice(this.options.basePath.length) || '/'
     }
-    const namespace = pathname
 
-    if (!this.router.hasNamespace(namespace)) {
-      raw.close(1008, `Unknown namespace: ${namespace}`)
+    const matched = this.router.match(pathname)
+    if (!matched) {
+      raw.close(1008, `Unknown namespace: ${pathname}`)
       return
     }
 
-    const socket = new SocketCraftSocket(raw, { namespace, store: this.store })
+    const handlers = matched.module
+
+    const socket = new SocketCraftSocket(raw, {
+      namespace: pathname,
+      store: this.store,
+      handlers,
+      maxBackpressure: this.options.maxBackpressure
+    })
+    socket.params = matched.params
     socket.query = Object.fromEntries(url.searchParams.entries())
     socket.request = request
 
@@ -67,29 +96,65 @@ export class SocketCraftServer {
     }
 
     this.store.addClient(socket)
-    const handlers = this.router.getNamespace(namespace)
 
     if (typeof handlers.onConnect === 'function') {
       await handlers.onConnect(socket)
     }
 
-    raw.on('message', async (rawMessage) => {
+    raw.on('message', async (rawMessage, isBinary) => {
+      if (isBinary) {
+        if (typeof handlers.onRawMessage === 'function') {
+          try {
+            await handlers.onRawMessage(socket, rawMessage)
+          } catch (error) {
+            if (typeof handlers.onError === 'function') {
+              handlers.onError(socket, error)
+            }
+          }
+        }
+        return
+      }
+
       let parsed
       try {
         parsed = JSON.parse(rawMessage.toString())
       } catch {
+        if (typeof handlers.onRawMessage === 'function') {
+          try {
+            await handlers.onRawMessage(socket, rawMessage)
+          } catch (error) {
+            if (typeof handlers.onError === 'function') {
+              handlers.onError(socket, error)
+            }
+          }
+        }
         return
       }
-      const { event, data } = parsed
+
+      const event = parsed.event
+      const data = parsed.data
+
       if (!event) return
+
       const handler = handlers[event]
-      if (typeof handler === 'function') {
-        try {
-          await handler(socket, data)
-        } catch (error) {
+      if (typeof handler !== 'function') return
+
+      if (handlers.schemas && handlers.schemas[event]) {
+        const isValid = validatePayload(handlers.schemas[event], data)
+        if (!isValid) {
+          socket.send('validationError', { event, message: 'Payload validation failed' })
           if (typeof handlers.onError === 'function') {
-            handlers.onError(socket, error)
+            handlers.onError(socket, new Error(`Validation failed for event: ${event}`))
           }
+          return
+        }
+      }
+
+      try {
+        await handler(socket, data)
+      } catch (error) {
+        if (typeof handlers.onError === 'function') {
+          handlers.onError(socket, error)
         }
       }
     })
@@ -131,9 +196,10 @@ export class SocketCraftServer {
       emit(event, data) {
         const members = store.getRoomMembers(room)
         if (!members) return
+        const payload = JSON.stringify({ event, data })
         for (const memberId of members) {
           const client = store.getClient(memberId)
-          if (client) client.send(event, data)
+          if (client) client.sendRaw(payload)
         }
       }
     }
@@ -143,8 +209,9 @@ export class SocketCraftServer {
     const store = this.store
     return {
       emit(event, data) {
+        const payload = JSON.stringify({ event, data })
         for (const client of store.getAllClients()) {
-          if (client.namespace === name) client.send(event, data)
+          if (client.namespace === name) client.sendRaw(payload)
         }
       }
     }
